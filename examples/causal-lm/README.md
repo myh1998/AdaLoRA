@@ -1,0 +1,46 @@
+# AdaLoRA Causal LM (Single GPU, Offline, Accelerate)
+
+This directory provides a simple single-GPU entrypoint for AdaLoRA hyperparameter search on WikiText-2 test perplexity.
+
+## Install
+
+```bash
+pip install -r requirements-modern.txt
+```
+
+## Run (3B first)
+
+```bash
+bash scripts/causal-lm/run_llama32_3b_wikitext2.sh
+```
+
+## Run (8B second)
+
+```bash
+bash scripts/causal-lm/run_llama31_8b_wikitext2.sh
+```
+
+## Resume
+
+Set `training.resume_from_checkpoint` in the chosen YAML to a checkpoint directory and rerun the same command.
+
+## Outputs
+
+Outputs are stored under:
+
+```text
+outputs/<model_name>/wikitext-2-raw-v1/adalora/seed_42/
+```
+
+Each `target_r_*` directory contains:
+- `adapter/` (adapter weights)
+- `metrics.json`
+- `config.snapshot.yaml`
+- TensorBoard logs
+
+Search-level summary files:
+- `summary.json`
+- `summary.csv`
+- `summary.md`
+
+The best result is defined as lowest **test perplexity**.
