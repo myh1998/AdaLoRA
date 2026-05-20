@@ -8,12 +8,15 @@ model:
 data:
   dataset_name: wikitext
   dataset_config_name: wikitext-2-raw-v1
+  eval_split: test
+  eval_count: 500
   cache_dir: /home/users/tomomasa_yamasaki/.cache/huggingface/datasets
   block_size: 256
   seq_len: 256
   ga_seq_len: 128
   ppl_max_len: 1024
-  ppl_max_tokens: 4096
+  ppl_max_tokens: 32768
+  ppl_stride: 1024
 
 peft:
   target_modules:

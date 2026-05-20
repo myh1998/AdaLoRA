@@ -20,6 +20,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer, DataCollatorForLan
 class RunResult:
     target_r: int
     test_perplexity: float
+    test_perplexity_trainer: float
     output_dir: str
 
 
@@ -38,8 +39,6 @@ def _validate_config(cfg: Dict[str, Any]) -> None:
     _require_keys(cfg["search"], ["target_r_values"], "search")
     _require_keys(cfg["output"], ["root_dir"], "output")
 
-    if cfg["data"]["ppl_max_tokens"] != 4096:
-        raise ValueError("ppl_max_tokens must be fixed to 4096 by project decision.")
     if cfg["training"]["seed"] != 42:
         raise ValueError("seed must be fixed to 42 by project decision.")
 
@@ -83,6 +82,63 @@ def _load_and_tokenize(cfg: Dict[str, Any], tokenizer: Any):
         return result
 
     return tokenized.map(group_texts, batched=True)
+
+
+def _load_eval_texts(cfg: Dict[str, Any]) -> List[str]:
+    ds_cfg = cfg["data"]
+    raw = load_dataset(
+        ds_cfg["dataset_name"],
+        ds_cfg["dataset_config_name"],
+        cache_dir=ds_cfg.get("cache_dir"),
+    )
+    split = ds_cfg.get("eval_split", "test")
+    eval_count = int(ds_cfg.get("eval_count", 500))
+    ds = raw[split]
+    max_count = min(eval_count, len(ds))
+    texts = [
+        x["text"]
+        for x in ds.select(range(max_count))
+        if x["text"] and len(x["text"].strip()) > 0
+    ]
+    return texts
+
+
+@torch.no_grad()
+def eval_ppl_sliding_window(
+    model: Any,
+    tokenizer: Any,
+    eval_texts: List[str],
+    max_length: int = 1024,
+    max_eval_tokens: int = 32768,
+    stride: int = 1024,
+) -> float:
+    was_training = model.training
+    model.eval()
+
+    device = next(model.parameters()).device
+    joined = "\n\n".join([t for t in eval_texts if t and len(t.strip()) > 0])
+    input_ids = tokenizer(joined, return_tensors="pt")["input_ids"][0]
+    input_ids = input_ids[:max_eval_tokens].unsqueeze(0).to(device)
+
+    nll_sum = 0.0
+    tok_sum = 0
+    seq_len = input_ids.shape[1]
+
+    for i in range(0, seq_len - 1, stride):
+        end = min(i + max_length, seq_len)
+        chunk = input_ids[:, i:end]
+        if chunk.size(1) <= 1:
+            continue
+        out = model(chunk, labels=chunk)
+        trg_len = chunk.size(1) - 1
+        nll_sum += out.loss.item() * trg_len
+        tok_sum += trg_len
+
+    if was_training:
+        model.train()
+    if tok_sum == 0:
+        return float("nan")
+    return math.exp(nll_sum / tok_sum)
 
 
 def _estimate_total_steps(cfg: Dict[str, Any], train_size: int) -> int:
@@ -155,6 +211,7 @@ def _run_single_target_r(
     tokenizer: Any,
     total_steps: int,
     schedule: Dict[str, int],
+    eval_texts: List[str],
 ) -> RunResult:
     model = _build_model(cfg, tokenizer)
 
@@ -206,10 +263,40 @@ def _run_single_target_r(
         processing_class=tokenizer,
     )
 
+    t0 = time.time()
     trainer.train(resume_from_checkpoint=training_cfg.get("resume_from_checkpoint", None))
-    metrics = trainer.evaluate(eval_dataset=lm_datasets["test"])
-    test_ppl = float(math.exp(metrics["eval_loss"]))
-    metrics["test_perplexity"] = test_ppl
+    train_runtime_sec = time.time() - t0
+    trainer_metrics = trainer.evaluate(eval_dataset=lm_datasets["test"])
+    test_ppl_trainer = float(math.exp(trainer_metrics["eval_loss"]))
+    test_ppl_common = eval_ppl_sliding_window(
+        model=model,
+        tokenizer=tokenizer,
+        eval_texts=eval_texts,
+        max_length=int(cfg["data"]["ppl_max_len"]),
+        max_eval_tokens=int(cfg["data"]["ppl_max_tokens"]),
+        stride=int(cfg["data"].get("ppl_stride", cfg["data"]["ppl_max_len"])),
+    )
+
+    metrics = dict(trainer_metrics)
+    metrics["test_perplexity_trainer"] = test_ppl_trainer
+    metrics["test_perplexity_common"] = test_ppl_common
+    metrics["train_runtime_sec"] = train_runtime_sec
+    metrics["eval_protocol"] = {
+        "dataset": cfg["data"]["dataset_config_name"],
+        "split": cfg["data"].get("eval_split", "test"),
+        "eval_count": int(cfg["data"].get("eval_count", 500)),
+        "ppl_max_tokens": int(cfg["data"]["ppl_max_tokens"]),
+        "ppl_max_len": int(cfg["data"]["ppl_max_len"]),
+        "ppl_stride": int(cfg["data"].get("ppl_stride", cfg["data"]["ppl_max_len"])),
+    }
+
+    curve_path = out_dir / "time_to_threshold.csv"
+    with open(curve_path, "w", encoding="utf-8") as f:
+        f.write("runtime_sec,step,trainer_eval_loss,trainer_eval_ppl,test_ppl_common\n")
+        f.write(
+            f"{train_runtime_sec:.4f},{trainer.state.global_step},{trainer_metrics['eval_loss']:.8f},"
+            f"{test_ppl_trainer:.8f},{test_ppl_common:.8f}\n"
+        )
 
     trainer.save_model(str(out_dir / "adapter"))
     tokenizer.save_pretrained(str(out_dir / "adapter"))
@@ -218,7 +305,12 @@ def _run_single_target_r(
     with open(out_dir / "config.snapshot.yaml", "w", encoding="utf-8") as f:
         yaml.safe_dump(cfg, f, sort_keys=False)
 
-    return RunResult(target_r=target_r, test_perplexity=test_ppl, output_dir=str(out_dir))
+    return RunResult(
+        target_r=target_r,
+        test_perplexity=test_ppl_common,
+        test_perplexity_trainer=test_ppl_trainer,
+        output_dir=str(out_dir),
+    )
 
 
 def main() -> None:
@@ -233,6 +325,7 @@ def main() -> None:
 
     tokenizer = _load_tokenizer(cfg)
     lm_datasets = _load_and_tokenize(cfg, tokenizer)
+    eval_texts = _load_eval_texts(cfg)
     total_steps = _estimate_total_steps(cfg, len(lm_datasets["train"]))
     schedule = _resolve_schedule(cfg["peft"], total_steps)
 
@@ -245,7 +338,18 @@ def main() -> None:
 
     results: List[RunResult] = []
     for target_r in cfg["search"]["target_r_values"]:
-        results.append(_run_single_target_r(cfg, int(target_r), run_root, lm_datasets, tokenizer, total_steps, schedule))
+        results.append(
+            _run_single_target_r(
+                cfg,
+                int(target_r),
+                run_root,
+                lm_datasets,
+                tokenizer,
+                total_steps,
+                schedule,
+                eval_texts,
+            )
+        )
 
     elapsed_hours = (time.time() - start) / 3600
     overtime = max(0.0, elapsed_hours - max_hours)
@@ -253,25 +357,45 @@ def main() -> None:
     if overtime > 0:
         print(f"Exceeded time budget by: {overtime:.3f} hours")
 
-    summary_rows = [{"target_r": r.target_r, "test_perplexity": r.test_perplexity, "output_dir": r.output_dir} for r in sorted(results, key=lambda x: x.test_perplexity)]
+    summary_rows = [
+        {
+            "target_r": r.target_r,
+            "test_perplexity_common": r.test_perplexity,
+            "test_perplexity_trainer": r.test_perplexity_trainer,
+            "output_dir": r.output_dir,
+            "eval_protocol": {
+                "dataset": cfg["data"]["dataset_config_name"],
+                "split": cfg["data"].get("eval_split", "test"),
+                "eval_count": int(cfg["data"].get("eval_count", 500)),
+                "ppl_max_tokens": int(cfg["data"]["ppl_max_tokens"]),
+                "ppl_max_len": int(cfg["data"]["ppl_max_len"]),
+                "ppl_stride": int(cfg["data"].get("ppl_stride", cfg["data"]["ppl_max_len"])),
+            },
+        }
+        for r in sorted(results, key=lambda x: x.test_perplexity)
+    ]
     best = summary_rows[0]
 
     with open(run_root / "summary.json", "w", encoding="utf-8") as f:
         json.dump(summary_rows, f, indent=2)
     with open(run_root / "summary.csv", "w", encoding="utf-8") as f:
-        f.write("target_r,test_perplexity,output_dir\n")
+        f.write("target_r,test_perplexity_common,test_perplexity_trainer,output_dir\n")
         for row in summary_rows:
-            f.write(f"{row['target_r']},{row['test_perplexity']},{row['output_dir']}\n")
+            f.write(
+                f"{row['target_r']},{row['test_perplexity_common']},{row['test_perplexity_trainer']},{row['output_dir']}\n"
+            )
     with open(run_root / "summary.md", "w", encoding="utf-8") as f:
         f.write("# AdaLoRA Search Summary\n\n")
-        f.write("| rank | test ppl | output_dir |\n|---:|---:|---|\n")
+        f.write("| rank | test ppl (common) | test ppl (trainer) | output_dir |\n|---:|---:|---:|---|\n")
         for row in summary_rows:
-            f.write(f"| {row['target_r']} | {row['test_perplexity']:.6f} | `{row['output_dir']}` |\n")
+            f.write(
+                f"| {row['target_r']} | {row['test_perplexity_common']:.6f} | {row['test_perplexity_trainer']:.6f} | `{row['output_dir']}` |\n"
+            )
         f.write("\n")
         f.write(f"Best target_r: **{best['target_r']}**\\\n\n")
-        f.write(f"Best test ppl: **{best['test_perplexity']:.6f}**\n")
+        f.write(f"Best test ppl (common): **{best['test_perplexity_common']:.6f}**\n")
 
-    print(f"Best target_r = {best['target_r']}, test ppl = {best['test_perplexity']:.6f}")
+    print(f"Best target_r = {best['target_r']}, test ppl(common) = {best['test_perplexity_common']:.6f}")
 
 
 if __name__ == "__main__":

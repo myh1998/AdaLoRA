@@ -2,6 +2,8 @@
 
 This directory provides a simple single-GPU entrypoint for AdaLoRA hyperparameter search on WikiText-2 test perplexity.
 
+Final ranking uses a **common sliding-window evaluator** (`test_perplexity_common`) for alignment with other methods.
+
 ## Install
 
 ```bash
@@ -43,4 +45,7 @@ Search-level summary files:
 - `summary.csv`
 - `summary.md`
 
-The best result is defined as lowest **test perplexity**.
+Each `target_r_*` directory also stores:
+- `time_to_threshold.csv` (`runtime_sec, step, trainer_eval_loss, trainer_eval_ppl, test_ppl_common`)
+
+The best result is defined as lowest **test_perplexity_common**.
