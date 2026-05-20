@@ -1,0 +1,57 @@
+model:
+  model_name_or_path: /home/users/tomomasa_yamasaki/hf_models/meta-llama/Llama-3.1-8B
+  tokenizer_name_or_path: /home/users/tomomasa_yamasaki/hf_models/meta-llama/Llama-3.1-8B
+  torch_dtype: float16
+  gradient_checkpointing: true
+  local_files_only: true
+
+data:
+  dataset_name: wikitext
+  dataset_config_name: wikitext-2-raw-v1
+  eval_split: test
+  eval_count: 500
+  cache_dir: /home/users/tomomasa_yamasaki/.cache/huggingface/datasets
+  block_size: 256
+  seq_len: 256
+  ga_seq_len: 128
+  ppl_max_len: 1024
+  ppl_max_tokens: 32768
+  ppl_stride: 1024
+
+peft:
+  target_modules:
+    - self_attn.q_proj
+    - self_attn.v_proj
+    - self_attn.o_proj
+    - mlp.gate_proj
+    - mlp.up_proj
+    - mlp.down_proj
+  init_r: 32
+  tinit: 200
+  tfinal: 1000
+  deltaT: 10
+  beta1: 0.85
+  beta2: 0.85
+  lora_alpha: 32
+  lora_dropout: 0.05
+  orth_reg_weight: 0.5
+
+training:
+  num_train_epochs: 1
+  per_device_train_batch_size: 1
+  per_device_eval_batch_size: 1
+  gradient_accumulation_steps: 16
+  learning_rate: 0.0001
+  logging_steps: 10
+  save_steps: 100
+  eval_steps: 100
+  seed: 42
+  fp16: true
+  max_runtime_hours: 8
+  resume_from_checkpoint: null
+
+search:
+  target_r_values: [0, 8, 16, 32, 64, 128, 256]
+
+output:
+  root_dir: ./outputs
