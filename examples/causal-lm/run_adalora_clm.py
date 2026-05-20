@@ -93,6 +93,47 @@ def _estimate_total_steps(cfg: Dict[str, Any], train_size: int) -> int:
     return max(1, int(t["num_train_epochs"]) * steps_per_epoch)
 
 
+def _resolve_schedule(peft_cfg: Dict[str, Any], total_steps: int) -> Dict[str, int]:
+    tinit = int(peft_cfg["tinit"])
+    tfinal = int(peft_cfg["tfinal"])
+    delta_t = int(peft_cfg["deltaT"])
+
+    # PEFT AdaLoRA requires a non-empty budgeting phase.
+    # Keep at least one allocation interval in the middle phase.
+    min_budget_phase = max(1, delta_t)
+    max_warmup_total = max(0, total_steps - min_budget_phase)
+
+    if tinit + tfinal <= max_warmup_total:
+        return {"tinit": tinit, "tfinal": tfinal, "delta_t": delta_t}
+
+    if max_warmup_total <= 0:
+        raise ValueError(
+            f"total_step={total_steps} is too small for AdaLoRA scheduling "
+            f"(deltaT={delta_t}). Increase training steps or reduce deltaT."
+        )
+
+    # Keep original warmup ratio when shrinking.
+    ratio = tinit / max(1, (tinit + tfinal))
+    new_tinit = int(max_warmup_total * ratio)
+    new_tfinal = max_warmup_total - new_tinit
+
+    # Ensure strict tinit < tfinal and non-negative values.
+    if new_tinit >= new_tfinal:
+        new_tinit = max(0, (max_warmup_total - 1) // 2)
+        new_tfinal = max_warmup_total - new_tinit
+    if new_tinit >= new_tfinal:
+        raise ValueError(
+            "Unable to derive a valid AdaLoRA schedule. "
+            f"total_step={total_steps}, requested tinit={tinit}, tfinal={tfinal}, deltaT={delta_t}."
+        )
+
+    print(
+        "[AdaLoRA] Adjust schedule for available total_step: "
+        f"tinit {tinit}->{new_tinit}, tfinal {tfinal}->{new_tfinal}, total_step={total_steps}, deltaT={delta_t}"
+    )
+    return {"tinit": new_tinit, "tfinal": new_tfinal, "delta_t": delta_t}
+
+
 def _build_model(cfg: Dict[str, Any], tokenizer: Any):
     model_cfg = cfg["model"]
     model = AutoModelForCausalLM.from_pretrained(
@@ -106,7 +147,15 @@ def _build_model(cfg: Dict[str, Any], tokenizer: Any):
     return model
 
 
-def _run_single_target_r(cfg: Dict[str, Any], target_r: int, run_root: Path, lm_datasets: Any, tokenizer: Any, total_steps: int) -> RunResult:
+def _run_single_target_r(
+    cfg: Dict[str, Any],
+    target_r: int,
+    run_root: Path,
+    lm_datasets: Any,
+    tokenizer: Any,
+    total_steps: int,
+    schedule: Dict[str, int],
+) -> RunResult:
     model = _build_model(cfg, tokenizer)
 
     peft_cfg = cfg["peft"]
@@ -115,9 +164,9 @@ def _run_single_target_r(cfg: Dict[str, Any], target_r: int, run_root: Path, lm_
         target_modules=peft_cfg["target_modules"],
         init_r=peft_cfg["init_r"],
         target_r=target_r,
-        tinit=peft_cfg["tinit"],
-        tfinal=peft_cfg["tfinal"],
-        deltaT=peft_cfg["deltaT"],
+        tinit=schedule["tinit"],
+        tfinal=schedule["tfinal"],
+        deltaT=schedule["delta_t"],
         beta1=peft_cfg["beta1"],
         beta2=peft_cfg["beta2"],
         lora_alpha=peft_cfg["lora_alpha"],
@@ -186,6 +235,7 @@ def main() -> None:
     tokenizer = _load_tokenizer(cfg)
     lm_datasets = _load_and_tokenize(cfg, tokenizer)
     total_steps = _estimate_total_steps(cfg, len(lm_datasets["train"]))
+    schedule = _resolve_schedule(cfg["peft"], total_steps)
 
     model_name = Path(cfg["model"]["model_name_or_path"]).name
     run_root = Path(cfg["output"]["root_dir"]) / model_name / "wikitext-2-raw-v1" / "adalora" / "seed_42"
@@ -196,7 +246,7 @@ def main() -> None:
 
     results: List[RunResult] = []
     for target_r in cfg["search"]["target_r_values"]:
-        results.append(_run_single_target_r(cfg, int(target_r), run_root, lm_datasets, tokenizer, total_steps))
+        results.append(_run_single_target_r(cfg, int(target_r), run_root, lm_datasets, tokenizer, total_steps, schedule))
 
     elapsed_hours = (time.time() - start) / 3600
     overtime = max(0.0, elapsed_hours - max_hours)
