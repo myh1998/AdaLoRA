@@ -182,7 +182,6 @@ def _run_single_target_r(
 
     args = TrainingArguments(
         output_dir=str(out_dir),
-        overwrite_output_dir=True,
         num_train_epochs=training_cfg["num_train_epochs"],
         per_device_train_batch_size=training_cfg["per_device_train_batch_size"],
         per_device_eval_batch_size=training_cfg["per_device_eval_batch_size"],
