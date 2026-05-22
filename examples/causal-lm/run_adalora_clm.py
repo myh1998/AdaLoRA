@@ -13,7 +13,7 @@ import torch
 import yaml
 from datasets import load_dataset
 from peft import AdaLoraConfig, TaskType, get_peft_model
-from transformers import AutoModelForCausalLM, AutoTokenizer, DataCollatorForLanguageModeling, Trainer, TrainingArguments
+from transformers import AutoModelForCausalLM, AutoTokenizer, DataCollatorForLanguageModeling, Trainer, TrainerCallback, TrainingArguments
 
 
 @dataclass
@@ -21,6 +21,12 @@ class RunResult:
     target_r: int
     test_perplexity: float
     test_perplexity_trainer: float
+    effective_rank_total: int
+    effective_rank_avg: float
+    max_effective_rank_total_seen: int
+    num_adapted_matrices: int
+    initial_total_rank_budget: int
+    final_total_rank_budget: int
     output_dir: str
 
 
@@ -143,6 +149,8 @@ def eval_ppl_sliding_window(
 
 def _estimate_total_steps(cfg: Dict[str, Any], train_size: int) -> int:
     t = cfg["training"]
+    if int(t.get("max_steps", -1)) > 0:
+        return int(t["max_steps"])
     per_device_bs = max(1, int(t["per_device_train_batch_size"]))
     grad_acc = max(1, int(t["gradient_accumulation_steps"]))
     steps_per_epoch = math.ceil(train_size / per_device_bs / grad_acc)
@@ -188,6 +196,43 @@ def _resolve_schedule(peft_cfg: Dict[str, Any], total_steps: int) -> Dict[str, i
         f"tinit {tinit}->{new_tinit}, tfinal {tfinal}->{new_tfinal}, total_step={total_steps}, deltaT={delta_t}"
     )
     return {"tinit": new_tinit, "tfinal": new_tfinal, "delta_t": delta_t}
+
+
+def _extract_rank_stats(model: Any) -> Dict[str, Any]:
+    eps = 1e-6
+    pattern: Dict[str, int] = {}
+    for name, param in model.named_parameters():
+        if "lora_E" not in name:
+            continue
+        # lora_E shape is [r, 1] for AdaLoRA.
+        active = int((param.detach().abs().view(-1) > eps).sum().item())
+        pattern[name] = active
+
+    if not pattern:
+        return {
+            "effective_rank_total": 0,
+            "effective_rank_avg": 0.0,
+            "effective_rank_min": 0,
+            "effective_rank_max": 0,
+            "rank_pattern_json": "{}",
+        }
+
+    values = list(pattern.values())
+    return {
+        "effective_rank_total": int(sum(values)),
+        "effective_rank_avg": float(sum(values) / len(values)),
+        "effective_rank_min": int(min(values)),
+        "effective_rank_max": int(max(values)),
+        "rank_pattern_json": json.dumps(pattern, sort_keys=True),
+        "num_adapted_matrices": int(len(values)),
+    }
+
+
+def _theoretical_rank_budgets(init_r: int, target_r: int, num_adapted_matrices: int) -> Dict[str, int]:
+    return {
+        "initial_total_rank_budget": int(init_r * num_adapted_matrices),
+        "final_total_rank_budget": int(target_r * num_adapted_matrices),
+    }
 
 
 def _build_model(cfg: Dict[str, Any], tokenizer: Any):
@@ -237,9 +282,59 @@ def _run_single_target_r(
     out_dir = run_root / f"target_r_{target_r}"
     out_dir.mkdir(parents=True, exist_ok=True)
 
+    curve_path = out_dir / "time_to_threshold.csv"
+    with open(curve_path, "w", encoding="utf-8") as f:
+        f.write(
+            "runtime_sec,step,trainer_eval_loss,trainer_eval_ppl,test_ppl_common,"
+            "init_r,target_r,effective_rank_total,effective_rank_avg,max_effective_rank_total_seen,"
+            "num_adapted_matrices,initial_total_rank_budget,final_total_rank_budget,"
+            "effective_rank_min,effective_rank_max,rank_pattern_json\n"
+        )
+
+    class EvalCurveCallback(TrainerCallback):
+        def __init__(self):
+            self.start_time = time.time()
+            self.max_effective_rank_total_seen = 0
+
+        def on_evaluate(self, args, state, control, model=None, metrics=None, **kwargs):
+            if metrics is None or "eval_loss" not in metrics:
+                return
+            runtime_sec = time.time() - self.start_time
+            trainer_eval_loss = float(metrics["eval_loss"])
+            trainer_eval_ppl = float(math.exp(trainer_eval_loss))
+            test_ppl_common_cb = eval_ppl_sliding_window(
+                model=model,
+                tokenizer=tokenizer,
+                eval_texts=eval_texts,
+                max_length=int(cfg["data"]["ppl_max_len"]),
+                max_eval_tokens=int(cfg["data"]["ppl_max_tokens"]),
+                stride=int(cfg["data"].get("ppl_stride", cfg["data"]["ppl_max_len"])),
+            )
+            rank_stats = _extract_rank_stats(model)
+            self.max_effective_rank_total_seen = max(
+                self.max_effective_rank_total_seen, rank_stats["effective_rank_total"]
+            )
+            budget_stats = _theoretical_rank_budgets(
+                int(peft_cfg["init_r"]),
+                int(target_r),
+                int(rank_stats["num_adapted_matrices"]),
+            )
+            with open(curve_path, "a", encoding="utf-8") as f:
+                f.write(
+                    f"{runtime_sec:.4f},{state.global_step},{trainer_eval_loss:.8f},"
+                    f"{trainer_eval_ppl:.8f},{test_ppl_common_cb:.8f},"
+                    f"{peft_cfg['init_r']},{target_r},{rank_stats['effective_rank_total']},"
+                    f"{rank_stats['effective_rank_avg']:.6f},{self.max_effective_rank_total_seen},"
+                    f"{rank_stats['num_adapted_matrices']},"
+                    f"{budget_stats['initial_total_rank_budget']},{budget_stats['final_total_rank_budget']},"
+                    f"{rank_stats['effective_rank_min']},{rank_stats['effective_rank_max']},"
+                    f"\"{rank_stats['rank_pattern_json'].replace('\"', '\"\"')}\"\n"
+                )
+
     args = TrainingArguments(
         output_dir=str(out_dir),
         num_train_epochs=training_cfg["num_train_epochs"],
+        max_steps=int(training_cfg.get("max_steps", -1)),
         per_device_train_batch_size=training_cfg["per_device_train_batch_size"],
         per_device_eval_batch_size=training_cfg["per_device_eval_batch_size"],
         gradient_accumulation_steps=training_cfg["gradient_accumulation_steps"],
@@ -254,6 +349,7 @@ def _run_single_target_r(
         report_to=["tensorboard"],
     )
 
+    callback = EvalCurveCallback()
     trainer = Trainer(
         model=model,
         args=args,
@@ -261,6 +357,7 @@ def _run_single_target_r(
         eval_dataset=lm_datasets["test"],
         data_collator=DataCollatorForLanguageModeling(tokenizer=tokenizer, mlm=False),
         processing_class=tokenizer,
+        callbacks=[callback],
     )
 
     t0 = time.time()
@@ -289,13 +386,36 @@ def _run_single_target_r(
         "ppl_max_len": int(cfg["data"]["ppl_max_len"]),
         "ppl_stride": int(cfg["data"].get("ppl_stride", cfg["data"]["ppl_max_len"])),
     }
+    final_rank_stats = _extract_rank_stats(model)
+    final_budget_stats = _theoretical_rank_budgets(
+        int(peft_cfg["init_r"]),
+        int(target_r),
+        int(final_rank_stats["num_adapted_matrices"]),
+    )
+    metrics["init_r"] = int(peft_cfg["init_r"])
+    metrics["target_r"] = int(target_r)
+    metrics["num_adapted_matrices"] = int(final_rank_stats["num_adapted_matrices"])
+    metrics["initial_total_rank_budget"] = int(final_budget_stats["initial_total_rank_budget"])
+    metrics["final_total_rank_budget"] = int(final_budget_stats["final_total_rank_budget"])
+    metrics["effective_rank_total"] = int(final_rank_stats["effective_rank_total"])
+    metrics["effective_rank_avg"] = float(final_rank_stats["effective_rank_avg"])
+    metrics["effective_rank_min"] = int(final_rank_stats["effective_rank_min"])
+    metrics["effective_rank_max"] = int(final_rank_stats["effective_rank_max"])
+    metrics["rank_pattern_json"] = final_rank_stats["rank_pattern_json"]
+    metrics["max_effective_rank_total_seen"] = int(
+        max(callback.max_effective_rank_total_seen, final_rank_stats["effective_rank_total"])
+    )
 
-    curve_path = out_dir / "time_to_threshold.csv"
-    with open(curve_path, "w", encoding="utf-8") as f:
-        f.write("runtime_sec,step,trainer_eval_loss,trainer_eval_ppl,test_ppl_common\n")
+    with open(curve_path, "a", encoding="utf-8") as f:
         f.write(
             f"{train_runtime_sec:.4f},{trainer.state.global_step},{trainer_metrics['eval_loss']:.8f},"
-            f"{test_ppl_trainer:.8f},{test_ppl_common:.8f}\n"
+            f"{test_ppl_trainer:.8f},{test_ppl_common:.8f},"
+            f"{peft_cfg['init_r']},{target_r},{final_rank_stats['effective_rank_total']},"
+            f"{final_rank_stats['effective_rank_avg']:.6f},{metrics['max_effective_rank_total_seen']},"
+            f"{final_rank_stats['num_adapted_matrices']},"
+            f"{final_budget_stats['initial_total_rank_budget']},{final_budget_stats['final_total_rank_budget']},"
+            f"{final_rank_stats['effective_rank_min']},{final_rank_stats['effective_rank_max']},"
+            f"\"{final_rank_stats['rank_pattern_json'].replace('\"', '\"\"')}\"\n"
         )
 
     trainer.save_model(str(out_dir / "adapter"))
@@ -309,6 +429,12 @@ def _run_single_target_r(
         target_r=target_r,
         test_perplexity=test_ppl_common,
         test_perplexity_trainer=test_ppl_trainer,
+        effective_rank_total=metrics["effective_rank_total"],
+        effective_rank_avg=metrics["effective_rank_avg"],
+        max_effective_rank_total_seen=metrics["max_effective_rank_total_seen"],
+        num_adapted_matrices=metrics["num_adapted_matrices"],
+        initial_total_rank_budget=metrics["initial_total_rank_budget"],
+        final_total_rank_budget=metrics["final_total_rank_budget"],
         output_dir=str(out_dir),
     )
 
@@ -363,6 +489,12 @@ def main() -> None:
             "test_perplexity_common": r.test_perplexity,
             "test_perplexity_trainer": r.test_perplexity_trainer,
             "output_dir": r.output_dir,
+            "effective_rank_total": r.effective_rank_total,
+            "effective_rank_avg": r.effective_rank_avg,
+            "max_effective_rank_total_seen": r.max_effective_rank_total_seen,
+            "num_adapted_matrices": r.num_adapted_matrices,
+            "initial_total_rank_budget": r.initial_total_rank_budget,
+            "final_total_rank_budget": r.final_total_rank_budget,
             "eval_protocol": {
                 "dataset": cfg["data"]["dataset_config_name"],
                 "split": cfg["data"].get("eval_split", "test"),
@@ -379,10 +511,17 @@ def main() -> None:
     with open(run_root / "summary.json", "w", encoding="utf-8") as f:
         json.dump(summary_rows, f, indent=2)
     with open(run_root / "summary.csv", "w", encoding="utf-8") as f:
-        f.write("target_r,test_perplexity_common,test_perplexity_trainer,output_dir\n")
+        f.write(
+            "target_r,test_perplexity_common,test_perplexity_trainer,effective_rank_total,"
+            "effective_rank_avg,max_effective_rank_total_seen,num_adapted_matrices,"
+            "initial_total_rank_budget,final_total_rank_budget,output_dir\n"
+        )
         for row in summary_rows:
             f.write(
-                f"{row['target_r']},{row['test_perplexity_common']},{row['test_perplexity_trainer']},{row['output_dir']}\n"
+                f"{row['target_r']},{row['test_perplexity_common']},{row['test_perplexity_trainer']},"
+                f"{row['effective_rank_total']},{row['effective_rank_avg']},"
+                f"{row['max_effective_rank_total_seen']},{row['num_adapted_matrices']},"
+                f"{row['initial_total_rank_budget']},{row['final_total_rank_budget']},{row['output_dir']}\n"
             )
     with open(run_root / "summary.md", "w", encoding="utf-8") as f:
         f.write("# AdaLoRA Search Summary\n\n")

@@ -46,6 +46,15 @@ Search-level summary files:
 - `summary.md`
 
 Each `target_r_*` directory also stores:
-- `time_to_threshold.csv` (`runtime_sec, step, trainer_eval_loss, trainer_eval_ppl, test_ppl_common`)
+- `time_to_threshold.csv` with:
+  - `runtime_sec,step,trainer_eval_loss,trainer_eval_ppl,test_ppl_common`
+  - `init_r,target_r,effective_rank_total,effective_rank_avg,max_effective_rank_total_seen`
+  - `num_adapted_matrices,initial_total_rank_budget,final_total_rank_budget`
+  - `effective_rank_min,effective_rank_max,rank_pattern_json`
 
 The best result is defined as lowest **test_perplexity_common**.
+
+## Tuning step count and curve logging frequency
+
+- To change total optimization length, edit `training.max_steps` in the YAML config (currently `3000`).
+- To change curve logging cadence, edit `training.eval_steps` in the YAML config (currently `10`).
